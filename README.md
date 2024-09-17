@@ -14,14 +14,14 @@ Spoof is a Go package that provides transport that enables HTTP client requests 
 In order to use the transport, one needs to create a custom `http.Client` with it specified:
 
 ```go
-	client := http.Client{
-		Transport: spoof.Transport(),
-	}
+    client := http.Client{
+        Transport: spoof.Transport(),
+    }
 
     // Create a request with desired parameters.
 
-	res, err := client.Do(req)
-	if err != nil {
+    res, err := client.Do(req)
+    if err != nil {
         // ...
     }
 
