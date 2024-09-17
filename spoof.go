@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -35,30 +35,24 @@ var chromeHeaders = map[string]string{
 	`priority`:                  `u=0, i`,
 }
 
-func applyHeaders(h http.Header) {
-	for k, v := range chromeHeaders {
-		h.Set(k, v)
-	}
-}
-
-type Transport struct {
-	http2.Transport
-
-	once sync.Once
-}
-
-func (t *Transport) init() {
-	t.DialTLSContext = t.dialTLSContext
-	t.MaxHeaderListSize = 262144
+type transport struct {
+	*http2.Transport
 }
 
 func copyConfig(c *tls.Config) *utls.Config {
 	return &utls.Config{
-		ServerName: c.ServerName,
+		// TODO: Copy some more fields here.
+		Rand:               c.Rand,
+		Time:               c.Time,
+		RootCAs:            c.RootCAs,
+		NextProtos:         c.NextProtos,
+		ServerName:         c.ServerName,
+		ClientCAs:          c.ClientCAs,
+		InsecureSkipVerify: c.InsecureSkipVerify,
 	}
 }
 
-func (tr *Transport) dialTLSContext(ctx context.Context, network string, address string,
+func (tr *transport) dialTLSContext(ctx context.Context, network string, address string,
 	config *tls.Config) (net.Conn, error) {
 	conn, err := new(net.Dialer).DialContext(ctx, network, address)
 	if err != nil {
@@ -86,14 +80,14 @@ func (tr *Transport) dialTLSContext(ctx context.Context, network string, address
 	return tconn, nil
 }
 
-func (tr *Transport) decodeContent(res *http.Response) error {
+func (tr *transport) decodeContent(res *http.Response) error {
 	var (
 		encodings = strings.Split(res.Header.Get("Content-Encoding"), ",")
 		body      = res.Body
 	)
 
-	for i := len(encodings) - 1; i >= 0; i-- {
-		switch encodings[i] {
+	for _, encoding := range slices.Backward(encodings) {
+		switch encoding {
 		case "":
 			continue
 
@@ -120,7 +114,7 @@ func (tr *Transport) decodeContent(res *http.Response) error {
 			body = newReaderCloser(d, newMultiCloser(newZstdCloser(d), body))
 
 		default:
-			return fmt.Errorf("unsupported content encoding: %s", encodings[i])
+			return fmt.Errorf("unsupported content encoding: %s", encoding)
 		}
 	}
 
@@ -130,8 +124,17 @@ func (tr *Transport) decodeContent(res *http.Response) error {
 	return nil
 }
 
-func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	tr.once.Do(tr.init)
+func applyHeaders(h http.Header) {
+	for k, v := range chromeHeaders {
+		if _, ok := h[k]; !ok {
+			h.Set(k, v)
+		}
+	}
+}
+
+func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	_, noDecode := req.Header["Accept-Encoding"]
+
 	applyHeaders(req.Header)
 
 	res, err := tr.Transport.RoundTrip(req)
@@ -139,9 +142,43 @@ func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	if err := tr.decodeContent(res); err != nil {
-		return nil, errors.Join(err, drainAndClose(res.Body))
+	if !noDecode {
+		if err := tr.decodeContent(res); err != nil {
+			return nil, errors.Join(err, drainAndClose(res.Body))
+		}
 	}
 
 	return res, nil
+}
+
+// Transport creates a default http2.Transport with an extended ability
+// to be fingerprinted as a Chrome browser.
+//
+// See WithTransport for more information.
+func Transport() http.RoundTripper {
+	return WithTransport(&http2.Transport{
+		// TODO: Review if those default timeout values make sense.
+		IdleConnTimeout:  3 * time.Minute, // nginx http2_idle_timeout
+		ReadIdleTimeout:  30 * time.Second,
+		PingTimeout:      15 * time.Second, // http2.Transport default
+		WriteByteTimeout: 5 * time.Second,
+	})
+}
+
+// WithTransport extends a provided http2.Transport by the ability to be
+// fingerprinted as a Chrome browser. It tries to evade TLS fingerprinting
+// and sends common browser headers.
+//
+// The transport does not overwrite user-specified headers, so the user
+// is able to specify, for example, a custom "Accept-Language" header.
+// Use with care, as this might thwart evasion efforts.
+//
+// When setting the "Accept-Encoding" header, the user is responsible for
+// decoding the request body.
+func WithTransport(tr *http2.Transport) http.RoundTripper {
+	ret := transport{Transport: tr}
+	ret.DialTLSContext = ret.dialTLSContext
+	ret.MaxHeaderListSize = 262144
+
+	return &ret
 }
