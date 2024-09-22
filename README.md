@@ -15,7 +15,7 @@ In order to use the transport, one needs to create a custom `http.Client` with i
 
 ```go
     client := http.Client{
-        Transport: spoof.Transport(),
+        Transport: &spoof.Transport{},
     }
 
     // Create a request with desired parameters.
