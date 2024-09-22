@@ -1,16 +1,19 @@
 package spoof
 
 import (
+	"bufio"
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -35,52 +38,77 @@ var chromeHeaders = map[string]string{
 	`priority`:                  `u=0, i`,
 }
 
-type transport struct {
-	*http2.Transport
+// Transport implements http.RoundTripper with the ability to be
+// fingerprinted as a Chrome browser. It tries to evade TLS fingerprinting
+// and sends common browser headers.
+//
+// The transport does not overwrite user-specified headers, so the user
+// is able to specify, for example, a custom "Accept-Language" header.
+// Use with care, as this might thwart evasion efforts.
+//
+// When setting the "Accept-Encoding" header, the user is responsible for
+// decoding the request body.
+//
+// There's no idle connection pool implemented yet, so the connections
+// are closed after serving a request.
+type Transport struct {
+	RootCAs            *x509.CertPool
+	InsecureSkipVerify bool
+
+	once sync.Once
+	h2   http2.Transport
 }
 
-func copyConfig(c *tls.Config) *utls.Config {
-	return &utls.Config{
-		// TODO: Copy some more fields here.
-		Rand:               c.Rand,
-		Time:               c.Time,
-		RootCAs:            c.RootCAs,
-		NextProtos:         c.NextProtos,
-		ServerName:         c.ServerName,
-		ClientCAs:          c.ClientCAs,
-		InsecureSkipVerify: c.InsecureSkipVerify,
-	}
+func (tr *Transport) init() {
+	tr.h2.MaxHeaderListSize = 262144
 }
 
-func (tr *transport) dialTLSContext(ctx context.Context, network string, address string,
-	config *tls.Config) (net.Conn, error) {
-	conn, err := new(net.Dialer).DialContext(ctx, network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	tconn := utls.UClient(conn, copyConfig(config), utls.HelloChrome_120)
-
+func withDeadline[T net.Conn](ctx context.Context, conn T, f func(T) error) error {
 	dl, ok := ctx.Deadline()
 	if ok {
-		if err := tconn.SetDeadline(dl); err != nil {
-			return nil, errors.Join(err, tconn.Close())
-		}
-	}
-	if err := tconn.Handshake(); err != nil {
-		return nil, errors.Join(err, tconn.Close())
-	}
-
-	if ok {
-		if err := tconn.SetDeadline(time.Time{}); err != nil {
-			return nil, errors.Join(err, tconn.Close())
+		if err := conn.SetDeadline(dl); err != nil {
+			return err
 		}
 	}
 
-	return tconn, nil
+	if err := f(conn); err != nil {
+		return err
+	}
+
+	return conn.SetDeadline(time.Time{})
 }
 
-func (tr *transport) decodeContent(res *http.Response) error {
+func (tr *Transport) dialTLSContext(ctx context.Context, network, addr string) (*utls.UConn, string, error) {
+	conn, err := new(net.Dialer).DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, "", err
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, "", err
+	}
+
+	utlsConn := utls.UClient(
+		conn,
+		&utls.Config{
+			RootCAs:            tr.RootCAs,
+			ServerName:         host,
+			InsecureSkipVerify: tr.InsecureSkipVerify,
+		},
+		utls.HelloChrome_120,
+	)
+
+	if err := withDeadline(ctx, utlsConn, func(conn *utls.UConn) error {
+		return conn.Handshake()
+	}); err != nil {
+		return nil, "", errors.Join(err, utlsConn.Close())
+	}
+
+	return utlsConn, utlsConn.ConnectionState().NegotiatedProtocol, nil
+}
+
+func (tr *Transport) decodeContent(res *http.Response) error {
 	var (
 		encodings = strings.Split(res.Header.Get("Content-Encoding"), ",")
 		body      = res.Body
@@ -114,7 +142,7 @@ func (tr *transport) decodeContent(res *http.Response) error {
 			body = newReaderCloser(d, newMultiCloser(newZstdCloser(d), body))
 
 		default:
-			return fmt.Errorf("unsupported content encoding: %s", encoding)
+			return fmt.Errorf("spoof: unsupported content encoding %q", encoding)
 		}
 	}
 
@@ -122,6 +150,51 @@ func (tr *transport) decodeContent(res *http.Response) error {
 	res.Body = body
 
 	return nil
+}
+
+func (tr *Transport) roundTrip1(conn net.Conn, req *http.Request) (res *http.Response, err error) {
+	err = withDeadline(req.Context(), conn, func(conn net.Conn) error {
+		if err := req.Write(conn); err != nil {
+			return err
+		}
+
+		res, err = http.ReadResponse(bufio.NewReader(conn), req)
+		if err != nil {
+			return errors.Join(err, conn.Close())
+		}
+
+		return nil
+	})
+	return
+}
+
+func (tr *Transport) roundTrip2(conn net.Conn, req *http.Request) (res *http.Response, err error) {
+	err = withDeadline(req.Context(), conn, func(conn net.Conn) error {
+		h2Conn, err := tr.h2.NewClientConn(conn)
+		if err != nil {
+			return err
+		}
+
+		res, err = h2Conn.RoundTrip(req)
+		if err != nil {
+			return errors.Join(err, h2Conn.Close())
+		}
+
+		return nil
+	})
+	return res, nil
+}
+
+func addrFromURL(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+
+	if u.Scheme == "https" {
+		return u.Host + ":443"
+	}
+
+	return u.Host + ":80"
 }
 
 func applyHeaders(h http.Header) {
@@ -132,15 +205,43 @@ func applyHeaders(h http.Header) {
 	}
 }
 
-func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	_, noDecode := req.Header["Accept-Encoding"]
+func (tr *Transport) roundTrip(req *http.Request) (*http.Response, error) {
+	var (
+		addr        = addrFromURL(req.URL)
+		conn        net.Conn
+		proto       string
+		err         error
+		_, noDecode = req.Header["Accept-Encoding"]
+		res         *http.Response
+	)
 
-	applyHeaders(req.Header)
-
-	res, err := tr.Transport.RoundTrip(req)
+	switch req.URL.Scheme {
+	case "http":
+		conn, err = new(net.Dialer).DialContext(req.Context(), "tcp", addr)
+	case "https":
+		conn, proto, err = tr.dialTLSContext(req.Context(), "tcp", addr)
+	default:
+		err = fmt.Errorf("spoof: unsupported scheme %q", req.URL.Scheme)
+	}
 	if err != nil {
 		return nil, err
 	}
+
+	applyHeaders(req.Header)
+
+	switch proto {
+	case "http/1.1", "":
+		res, err = tr.roundTrip1(conn, req)
+	case "h2":
+		res, err = tr.roundTrip2(conn, req)
+	default:
+		err = fmt.Errorf("spoof: unsupported protocol %q", proto)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	res.Body = newReaderCloser(res.Body, newMultiCloser(res.Body, conn))
 
 	if !noDecode {
 		if err := tr.decodeContent(res); err != nil {
@@ -151,34 +252,7 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, nil
 }
 
-// Transport creates a default http2.Transport with an extended ability
-// to be fingerprinted as a Chrome browser.
-//
-// See WithTransport for more information.
-func Transport() http.RoundTripper {
-	return WithTransport(&http2.Transport{
-		// TODO: Review if those default timeout values make sense.
-		IdleConnTimeout:  3 * time.Minute, // nginx http2_idle_timeout
-		ReadIdleTimeout:  30 * time.Second,
-		PingTimeout:      15 * time.Second, // http2.Transport default
-		WriteByteTimeout: 5 * time.Second,
-	})
-}
-
-// WithTransport extends a provided http2.Transport by the ability to be
-// fingerprinted as a Chrome browser. It tries to evade TLS fingerprinting
-// and sends common browser headers.
-//
-// The transport does not overwrite user-specified headers, so the user
-// is able to specify, for example, a custom "Accept-Language" header.
-// Use with care, as this might thwart evasion efforts.
-//
-// When setting the "Accept-Encoding" header, the user is responsible for
-// decoding the request body.
-func WithTransport(tr *http2.Transport) http.RoundTripper {
-	ret := transport{Transport: tr}
-	ret.DialTLSContext = ret.dialTLSContext
-	ret.MaxHeaderListSize = 262144
-
-	return &ret
+func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tr.once.Do(tr.init)
+	return tr.roundTrip(req)
 }

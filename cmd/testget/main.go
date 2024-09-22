@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"time"
 
 	"github.com/ksinica/spoof"
 )
@@ -25,10 +28,16 @@ func main() {
 	}
 
 	c := http.Client{
-		Transport: spoof.Transport(),
+		Transport: &spoof.Transport{},
 	}
 
-	req, err := http.NewRequest(http.MethodGet, os.Args[1], nil)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, os.Args[1], nil)
 	if err != nil {
 		printError(err)
 		os.Exit(1)
